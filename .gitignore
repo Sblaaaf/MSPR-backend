@@ -37,3 +37,6 @@ Thumbs.db
 *~
 *.swp
 *.swo
+
+# Project specific
+ia-kcal/
