@@ -14,7 +14,7 @@ RUN pip install --upgrade pip && \
 COPY . /app
 
 # Exposer le port FastAPI
-EXPOSE 8000
+EXPOSE 8001
 
 # Commande de démarrage (avec dev reload pour développement)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
