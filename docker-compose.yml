@@ -1,0 +1,9 @@
+services:
+  kcal:
+    build: ./services/kcal
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/kcal:/app
+    environment:
+      - ENV=development
