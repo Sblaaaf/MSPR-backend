@@ -186,11 +186,13 @@ def etl_aliments(engine) -> dict:
     logger.info("=" * 50)
     logger.info("ETL 1 : Aliments — début")
 
-    # Supprimer les données existantes pour permettre la réexécution
+    # Suppression sécurisée des dépendances pour éviter les erreurs de clé étrangère
     with engine.connect() as conn:
+        conn.execute(text("DELETE FROM ligne_repas"))
+        conn.execute(text("DELETE FROM journal_repas"))
         conn.execute(text("DELETE FROM aliment"))
         conn.commit()
-    logger.info("Données aliments existantes supprimées.")
+    logger.info("Données aliments et dépendances supprimées.")
 
     df = charger_fichier("daily_food_nutrition_dataset.csv", encoding="utf-8", on_bad_lines="skip")
 
