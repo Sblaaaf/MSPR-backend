@@ -44,8 +44,10 @@ services:
     environment:
       - ENV=development
       - KCAL_SERVICE_URL=http://kcal:8001
+      - MEAL_SERVICE_URL=http://meal:8003
     depends_on:
       - kcal
+      - meal
 
   kcal:
     build: ./services/kcal
@@ -55,6 +57,21 @@ services:
       - ./services/kcal:/app
     environment:
       - ENV=development
+    depends_on:
+      - db
+
+  meal:
+    build: ./services/meal
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./services/meal:/app
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=healthai
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
     depends_on:
       - db
 
