@@ -2,6 +2,9 @@
 
 Backend de l'application MSPR pour l'analyse nutritionnelle des repas, basé sur une architecture microservices FastAPI.
 
+DOCUMENTATION COMPLETE :
+https://satisfying-activity-4ab.notion.site/JARMY-API-329e716da2bc80fe85f0d310e12d712e?source=copy_link
+
 ---
 
 ## 🚀 Démarrage rapide
