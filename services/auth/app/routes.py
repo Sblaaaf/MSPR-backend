@@ -29,12 +29,13 @@ class LoginResponse(BaseModel):
     message: str = Field(..., example="Authentification réussie.", description="Message de retour")
     user_id: int | None = Field(None, example=1, description="ID utilisateur si succès")
     email: EmailStr | None = Field(None, example="jean.dupont@example.com", description="Email utilisateur si succès")
-
+    abonnement: str | None = Field(None, example="freemium", description="Type d'abonnement de l'utilisateur") # NOUVEAU
 
 @router.post("/login", response_model=LoginResponse)
 def login(payload: LoginRequest):
+    # Ajout de 'abonnement' dans le SELECT
     user = fetch_one(
-        "SELECT id, email, mdp_hash, actif FROM utilisateur WHERE email = :email",
+        "SELECT id, email, mdp_hash, actif, abonnement FROM utilisateur WHERE email = :email",
         {"email": payload.email},
     )
     if not user:
@@ -51,4 +52,5 @@ def login(payload: LoginRequest):
         message="Authentification réussie.",
         user_id=user["id"],
         email=user["email"],
+        abonnement=user["abonnement"], # NOUVEAU
     )

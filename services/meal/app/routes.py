@@ -158,6 +158,23 @@ class MealResponse(BaseModel):
     items: list[MealLineResponse]
 
 
+class MetricResponse(BaseModel):
+    date_mesure: date = Field(..., description="Date de la mesure")
+    poids_kg: Optional[float] = Field(None, description="Poids en kg")
+    heures_sommeil: Optional[float] = Field(None, description="Heures de sommeil")
+    bpm_repos: Optional[int] = Field(None, description="Battements par minute au repos")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "date_mesure": "2024-05-01",
+                "poids_kg": 78.5,
+                "heures_sommeil": 7.5,
+                "bpm_repos": 62
+            }
+        }
+
+
 @router.post("/aliments", response_model=AlimentResponse)
 def create_aliment(payload: AlimentCreate):
     existing = fetch_one(
@@ -348,3 +365,19 @@ def delete_meal(meal_id: int):
         raise HTTPException(404, "Repas introuvable")
     execute_write("DELETE FROM journal_repas WHERE id = :meal_id", {"meal_id": meal_id})
     return {"status": "deleted", "meal_id": meal_id}
+
+@router.get("/users/{user_id}/metrics", response_model=list[MetricResponse])
+def get_user_metrics(user_id: int):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    sql = """
+        SELECT date_mesure, poids_kg, heures_sommeil, bpm_repos 
+        FROM metrique_quotidienne 
+        WHERE utilisateur_id = :user_id 
+        ORDER BY date_mesure ASC 
+        LIMIT 30
+    """
+    rows = fetch_all(sql, {"user_id": user_id})
+    return [MetricResponse(**row) for row in rows]
