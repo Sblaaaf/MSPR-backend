@@ -174,6 +174,24 @@ class MetricResponse(BaseModel):
             }
         }
 
+class ObjectifResponse(BaseModel):
+    id: int
+    libelle: str
+    description: str
+    date_debut: date
+    actif: bool
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "id": 1,
+                "libelle": "perte_de_poids",
+                "description": "Réduire la masse graisseuse",
+                "date_debut": "2024-05-01",
+                "actif": True
+            }
+        }
+
 
 @router.post("/aliments", response_model=AlimentResponse)
 def create_aliment(payload: AlimentCreate):
@@ -381,3 +399,20 @@ def get_user_metrics(user_id: int):
     """
     rows = fetch_all(sql, {"user_id": user_id})
     return [MetricResponse(**row) for row in rows]
+
+
+@router.get("/users/{user_id}/objectives", response_model=list[ObjectifResponse])
+def get_user_objectives(user_id: int):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    sql = """
+        SELECT o.id, o.libelle, o.description, uo.date_debut, uo.actif
+        FROM utilisateur_objectif uo
+        JOIN objectif o ON uo.objectif_id = o.id
+        WHERE uo.utilisateur_id = :user_id
+        ORDER BY uo.date_debut DESC
+    """
+    rows = fetch_all(sql, {"user_id": user_id})
+    return [ObjectifResponse(**row) for row in rows]
