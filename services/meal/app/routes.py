@@ -174,6 +174,15 @@ class MetricResponse(BaseModel):
             }
         }
 
+class UserSubscriptionUpdate(BaseModel):
+    abonnement: str = Field(..., example="premium", description="Nouveau type d'abonnement")
+
+    @model_validator(mode='after')
+    def check_abonnement(self):
+        if self.abonnement not in ALLOWED_ABONNEMENT:
+            raise ValueError(f"Abonnement invalide. Valeurs possibles : {ALLOWED_ABONNEMENT}")
+        return self
+
 
 @router.post("/aliments", response_model=AlimentResponse)
 def create_aliment(payload: AlimentCreate):
@@ -365,6 +374,7 @@ def delete_meal(meal_id: int):
         raise HTTPException(404, "Repas introuvable")
     execute_write("DELETE FROM journal_repas WHERE id = :meal_id", {"meal_id": meal_id})
     return {"status": "deleted", "meal_id": meal_id}
+    
 
 @router.get("/users/{user_id}/metrics", response_model=list[MetricResponse])
 def get_user_metrics(user_id: int):
@@ -381,3 +391,19 @@ def get_user_metrics(user_id: int):
     """
     rows = fetch_all(sql, {"user_id": user_id})
     return [MetricResponse(**row) for row in rows]
+
+
+@router.patch("/users/{user_id}/subscription", response_model=UserResponse)
+def update_user_subscription(user_id: int, payload: UserSubscriptionUpdate):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    result = execute_write(
+        "UPDATE utilisateur SET abonnement = :abonnement WHERE id = :user_id "
+        "RETURNING id, nom, prenom, email, sexe, abonnement, date_inscription, actif",
+        {"abonnement": payload.abonnement, "user_id": user_id}
+    )
+    
+    row = result.mappings().first()
+    return UserResponse(**dict(row))
