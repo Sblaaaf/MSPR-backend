@@ -30,7 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SECRET_TOKEN = "clesecrete"
+SECRET_TOKEN = os.getenv("KCAL_SECRET_TOKEN", "clesecrete")
 security = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):

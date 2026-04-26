@@ -1,8 +1,10 @@
 from hashlib import sha256
 from pydantic import BaseModel, EmailStr, Field
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from database import fetch_one
+from .translations import get_message
+from .lang_dep import get_language
 
 router = APIRouter()
 
@@ -29,28 +31,40 @@ class LoginResponse(BaseModel):
     message: str = Field(..., example="Authentification réussie.", description="Message de retour")
     user_id: int | None = Field(None, example=1, description="ID utilisateur si succès")
     email: EmailStr | None = Field(None, example="jean.dupont@example.com", description="Email utilisateur si succès")
-    abonnement: str | None = Field(None, example="freemium", description="Type d'abonnement de l'utilisateur") # NOUVEAU
+    nom: str | None = Field(None, example="Dupont", description="Nom de famille")
+    prenom: str | None = Field(None, example="Jean", description="Prénom")
+    abonnement: str | None = Field(None, example="freemium", description="Type d'abonnement de l'utilisateur")
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest):
-    # Ajout de 'abonnement' dans le SELECT
+def login(payload: LoginRequest, language: str = Depends(get_language)):
     user = fetch_one(
-        "SELECT id, email, mdp_hash, actif, abonnement FROM utilisateur WHERE email = :email",
+        "SELECT id, email, nom, prenom, mdp_hash, actif, abonnement FROM utilisateur WHERE email = :email",
         {"email": payload.email},
     )
     if not user:
-        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect.")
+        raise HTTPException(
+            status_code=401,
+            detail=get_message("invalid_credentials", language)
+        )
 
     if not user["actif"]:
-        raise HTTPException(status_code=403, detail="Utilisateur inactif.")
+        raise HTTPException(
+            status_code=403,
+            detail=get_message("user_inactive", language)
+        )
 
     if user["mdp_hash"] != hash_password(payload.password):
-        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect.")
+        raise HTTPException(
+            status_code=401,
+            detail=get_message("invalid_credentials", language)
+        )
 
     return LoginResponse(
         success=True,
-        message="Authentification réussie.",
+        message=get_message("login_success", language),
         user_id=user["id"],
         email=user["email"],
-        abonnement=user["abonnement"], # NOUVEAU
+        nom=user["nom"],
+        prenom=user["prenom"],
+        abonnement=user["abonnement"],
     )

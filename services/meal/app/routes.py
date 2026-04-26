@@ -2,10 +2,12 @@ from datetime import date, datetime
 from hashlib import sha256
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, EmailStr, model_validator
 
 from database import execute_write, fetch_all, fetch_one
+from .translations import get_message
+from .lang_dep import get_language
 
 router = APIRouter()
 
@@ -201,13 +203,13 @@ class ObjectifResponse(BaseModel):
 
 
 @router.post("/aliments", response_model=AlimentResponse)
-def create_aliment(payload: AlimentCreate):
+def create_aliment(payload: AlimentCreate, language: str = Depends(get_language)):
     existing = fetch_one(
         "SELECT id FROM aliment WHERE LOWER(nom) = LOWER(:nom)",
         {"nom": payload.nom},
     )
     if existing:
-        raise HTTPException(400, "Cet aliment existe déjà")
+        raise HTTPException(400, get_message("aliment_already_exists", language))
 
     result = execute_write(
         "INSERT INTO aliment (nom, categorie, calories_100g, proteines_g, glucides_g, lipides_g, fibres_g, sodium_mg, sucres_g, source_dataset)"
@@ -231,10 +233,10 @@ def list_aliments(query: Optional[str] = Query(None, description="Filtrer par no
 
 
 @router.post("/users", response_model=UserResponse)
-def create_user(payload: UserCreate):
+def create_user(payload: UserCreate, language: str = Depends(get_language)):
     existing = fetch_one("SELECT id FROM utilisateur WHERE email = :email", {"email": payload.email})
     if existing:
-        raise HTTPException(400, "Email déjà utilisé")
+        raise HTTPException(400, get_message("email_already_used", language))
 
     params = payload.model_dump(exclude={"password"})
     params["mdp_hash"] = hash_password(payload.password)
@@ -249,21 +251,21 @@ def create_user(payload: UserCreate):
 
 
 @router.get("/users/{user_id}", response_model=UserResponse)
-def get_user(user_id: int):
+def get_user(user_id: int, language: str = Depends(get_language)):
     user = fetch_one(
         "SELECT id, nom, prenom, email, sexe, abonnement, date_inscription, actif FROM utilisateur WHERE id = :user_id",
         {"user_id": user_id},
     )
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
     return UserResponse(**user)
 
 
-def resolve_aliment(item: MealLineCreate) -> dict:
+def resolve_aliment(item: MealLineCreate, language: str = "EN") -> dict:
     if item.aliment_id:
         aliment = fetch_one("SELECT id, nom, calories_100g, categorie, source_dataset FROM aliment WHERE id = :id", {"id": item.aliment_id})
         if not aliment:
-            raise HTTPException(404, f"Aliment introuvable id={item.aliment_id}")
+            raise HTTPException(404, get_message("aliment_not_found", language, id=item.aliment_id))
         return aliment
 
     aliment = fetch_one(
@@ -287,7 +289,7 @@ def resolve_aliment(item: MealLineCreate) -> dict:
     return dict(result.mappings().first())
 
 
-def get_meal_response(journal_id: int) -> MealResponse:
+def get_meal_response(journal_id: int, language: str = "EN") -> MealResponse:
     rows = fetch_all(
         "SELECT jr.id AS meal_id, jr.utilisateur_id, jr.date_repas, jr.type_repas, jr.notes, jr.created_at, "
         " lr.id AS ligne_id, lr.quantite_g, lr.calories_calculees, "
@@ -300,7 +302,7 @@ def get_meal_response(journal_id: int) -> MealResponse:
         {"journal_id": journal_id},
     )
     if not rows:
-        raise HTTPException(404, "Repas introuvable")
+        raise HTTPException(404, get_message("meal_not_found", language))
 
     items = []
     total = 0.0
@@ -334,10 +336,10 @@ def get_meal_response(journal_id: int) -> MealResponse:
 
 
 @router.post("/users/{user_id}/meals", response_model=MealResponse)
-def create_meal(user_id: int, payload: MealCreate):
+def create_meal(user_id: int, payload: MealCreate, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     journal_result = execute_write(
         "INSERT INTO journal_repas (utilisateur_id, date_repas, type_repas, notes) "
@@ -352,7 +354,7 @@ def create_meal(user_id: int, payload: MealCreate):
     journal_id = journal_result.scalar_one()
 
     for item in payload.items:
-        aliment = resolve_aliment(item)
+        aliment = resolve_aliment(item, language)
         execute_write(
             "INSERT INTO ligne_repas (journal_id, aliment_id, quantite_g) "
             "VALUES (:journal_id, :aliment_id, :quantite_g)",
@@ -363,40 +365,40 @@ def create_meal(user_id: int, payload: MealCreate):
             },
         )
 
-    return get_meal_response(journal_id)
+    return get_meal_response(journal_id, language)
 
 
 @router.get("/users/{user_id}/meals", response_model=list[MealResponse])
-def list_meals(user_id: int):
+def list_meals(user_id: int, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     journals = fetch_all(
         "SELECT id FROM journal_repas WHERE utilisateur_id = :user_id ORDER BY date_repas DESC, id",
         {"user_id": user_id},
     )
-    return [get_meal_response(j["id"]) for j in journals]
+    return [get_meal_response(j["id"], language) for j in journals]
 
 
 @router.get("/meals/{meal_id}", response_model=MealResponse)
-def get_meal(meal_id: int):
-    return get_meal_response(meal_id)
+def get_meal(meal_id: int, language: str = Depends(get_language)):
+    return get_meal_response(meal_id, language)
 
 
 @router.delete("/meals/{meal_id}")
-def delete_meal(meal_id: int):
+def delete_meal(meal_id: int, language: str = Depends(get_language)):
     meal = fetch_one("SELECT id FROM journal_repas WHERE id = :meal_id", {"meal_id": meal_id})
     if not meal:
-        raise HTTPException(404, "Repas introuvable")
+        raise HTTPException(404, get_message("meal_not_found", language))
     execute_write("DELETE FROM journal_repas WHERE id = :meal_id", {"meal_id": meal_id})
     return {"status": "deleted", "meal_id": meal_id}
 
 @router.get("/users/{user_id}/metrics", response_model=list[MetricResponse])
-def get_user_metrics(user_id: int):
+def get_user_metrics(user_id: int, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     sql = """
         SELECT date_mesure, poids_kg, heures_sommeil, bpm_repos
@@ -410,10 +412,10 @@ def get_user_metrics(user_id: int):
 
 
 @router.post("/users/{user_id}/metrics", response_model=MetricResponse)
-def create_user_metric(user_id: int, payload: MetricCreate):
+def create_user_metric(user_id: int, payload: MetricCreate, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     execute_write(
         """
@@ -445,12 +447,12 @@ class SubscriptionUpdate(BaseModel):
 
 
 @router.patch("/users/{user_id}/subscription", response_model=UserResponse)
-def update_subscription(user_id: int, payload: SubscriptionUpdate):
+def update_subscription(user_id: int, payload: SubscriptionUpdate, language: str = Depends(get_language)):
     if payload.abonnement not in ALLOWED_ABONNEMENT:
-        raise HTTPException(400, f"Abonnement invalide. Valeurs acceptées : {ALLOWED_ABONNEMENT}")
+        raise HTTPException(400, get_message("invalid_subscription", language, values=", ".join(ALLOWED_ABONNEMENT)))
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
     result = execute_write(
         "UPDATE utilisateur SET abonnement = :abonnement WHERE id = :user_id"
         " RETURNING id, nom, prenom, email, sexe, abonnement, date_inscription, actif",
@@ -461,10 +463,10 @@ def update_subscription(user_id: int, payload: SubscriptionUpdate):
 
 
 @router.get("/users/{user_id}/objectives", response_model=list[ObjectifResponse])
-def get_user_objectives(user_id: int):
+def get_user_objectives(user_id: int, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     sql = """
         SELECT o.id, o.libelle, o.description, uo.date_debut, uo.actif
@@ -494,21 +496,21 @@ class ObjectiveAdd(BaseModel):
 
 
 @router.post("/users/{user_id}/objectives", response_model=ObjectifResponse)
-def add_user_objective(user_id: int, payload: ObjectiveAdd):
+def add_user_objective(user_id: int, payload: ObjectiveAdd, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     objectif = fetch_one("SELECT id, libelle, description FROM objectif WHERE id = :id", {"id": payload.objectif_id})
     if not objectif:
-        raise HTTPException(404, "Objectif introuvable")
+        raise HTTPException(404, get_message("objective_not_found", language))
 
     existing = fetch_one(
         "SELECT 1 FROM utilisateur_objectif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
         {"user_id": user_id, "objectif_id": payload.objectif_id},
     )
     if existing:
-        raise HTTPException(400, "Cet objectif est déjà défini pour cet utilisateur")
+        raise HTTPException(400, get_message("objective_already_set", language))
 
     execute_write(
         "INSERT INTO utilisateur_objectif (utilisateur_id, objectif_id, date_debut, actif)"
@@ -529,13 +531,13 @@ class ObjectiveToggle(BaseModel):
 
 
 @router.patch("/users/{user_id}/objectives/{objectif_id}", response_model=ObjectifResponse)
-def toggle_user_objective(user_id: int, objectif_id: int, payload: ObjectiveToggle):
+def toggle_user_objective(user_id: int, objectif_id: int, payload: ObjectiveToggle, language: str = Depends(get_language)):
     existing = fetch_one(
         "SELECT 1 FROM utilisateur_objectif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
         {"user_id": user_id, "objectif_id": objectif_id},
     )
     if not existing:
-        raise HTTPException(404, "Objectif introuvable pour cet utilisateur")
+        raise HTTPException(404, get_message("user_objective_not_found", language))
 
     execute_write(
         "UPDATE utilisateur_objectif SET actif = :actif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
@@ -551,10 +553,10 @@ def toggle_user_objective(user_id: int, objectif_id: int, payload: ObjectiveTogg
 
 
 @router.delete("/users/{user_id}")
-def delete_user(user_id: int):
+def delete_user(user_id: int, language: str = Depends(get_language)):
     user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
     if not user:
-        raise HTTPException(404, "Utilisateur introuvable")
+        raise HTTPException(404, get_message("user_not_found", language))
 
     execute_write(
         "DELETE FROM ligne_repas WHERE journal_id IN (SELECT id FROM journal_repas WHERE utilisateur_id = :user_id)",
