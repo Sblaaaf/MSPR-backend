@@ -158,6 +158,13 @@ class MealResponse(BaseModel):
     items: list[MealLineResponse]
 
 
+class MetricCreate(BaseModel):
+    date_mesure: date = Field(..., description="Date de la mesure")
+    poids_kg: Optional[float] = Field(None, description="Poids en kg")
+    heures_sommeil: Optional[float] = Field(None, description="Heures de sommeil")
+    bpm_repos: Optional[int] = Field(None, description="BPM au repos")
+
+
 class MetricResponse(BaseModel):
     date_mesure: date = Field(..., description="Date de la mesure")
     poids_kg: Optional[float] = Field(None, description="Poids en kg")
@@ -298,19 +305,20 @@ def get_meal_response(journal_id: int) -> MealResponse:
     items = []
     total = 0.0
     for row in rows:
+        kcal = round(float(row["quantite_g"]) * float(row["calories_100g"]) / 100.0, 2)
         items.append(
             MealLineResponse(
                 id=row["ligne_id"],
                 aliment_id=row["aliment_id"],
                 aliment_nom=row["aliment_nom"],
                 quantite_g=float(row["quantite_g"]),
-                calories_calculees=float(row["calories_calculees"]),
+                calories_calculees=kcal,
                 calories_100g=float(row["calories_100g"]),
                 categorie=row["categorie"],
                 source_dataset=row["source_dataset"],
             )
         )
-        total += float(row["calories_calculees"])
+        total += kcal
 
     first = rows[0]
     return MealResponse(
@@ -391,14 +399,65 @@ def get_user_metrics(user_id: int):
         raise HTTPException(404, "Utilisateur introuvable")
 
     sql = """
-        SELECT date_mesure, poids_kg, heures_sommeil, bpm_repos 
-        FROM metrique_quotidienne 
-        WHERE utilisateur_id = :user_id 
-        ORDER BY date_mesure ASC 
-        LIMIT 30
+        SELECT date_mesure, poids_kg, heures_sommeil, bpm_repos
+        FROM metrique_quotidienne
+        WHERE utilisateur_id = :user_id
+        ORDER BY date_mesure ASC
+        LIMIT 90
     """
     rows = fetch_all(sql, {"user_id": user_id})
-    return [MetricResponse(**row) for row in rows]
+    return [MetricResponse(**dict(row)) for row in rows]
+
+
+@router.post("/users/{user_id}/metrics", response_model=MetricResponse)
+def create_user_metric(user_id: int, payload: MetricCreate):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    execute_write(
+        """
+        INSERT INTO metrique_quotidienne (utilisateur_id, date_mesure, poids_kg, heures_sommeil, bpm_repos)
+        VALUES (:user_id, :date_mesure, :poids_kg, :heures_sommeil, :bpm_repos)
+        ON CONFLICT (utilisateur_id, date_mesure)
+        DO UPDATE SET
+            poids_kg = COALESCE(EXCLUDED.poids_kg, metrique_quotidienne.poids_kg),
+            heures_sommeil = COALESCE(EXCLUDED.heures_sommeil, metrique_quotidienne.heures_sommeil),
+            bpm_repos = COALESCE(EXCLUDED.bpm_repos, metrique_quotidienne.bpm_repos)
+        """,
+        {
+            "user_id": user_id,
+            "date_mesure": payload.date_mesure,
+            "poids_kg": payload.poids_kg,
+            "heures_sommeil": payload.heures_sommeil,
+            "bpm_repos": payload.bpm_repos,
+        },
+    )
+    row = fetch_one(
+        "SELECT date_mesure, poids_kg, heures_sommeil, bpm_repos FROM metrique_quotidienne WHERE utilisateur_id = :user_id AND date_mesure = :date_mesure",
+        {"user_id": user_id, "date_mesure": payload.date_mesure},
+    )
+    return MetricResponse(**dict(row))
+
+
+class SubscriptionUpdate(BaseModel):
+    abonnement: str
+
+
+@router.patch("/users/{user_id}/subscription", response_model=UserResponse)
+def update_subscription(user_id: int, payload: SubscriptionUpdate):
+    if payload.abonnement not in ALLOWED_ABONNEMENT:
+        raise HTTPException(400, f"Abonnement invalide. Valeurs acceptées : {ALLOWED_ABONNEMENT}")
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+    result = execute_write(
+        "UPDATE utilisateur SET abonnement = :abonnement WHERE id = :user_id"
+        " RETURNING id, nom, prenom, email, sexe, abonnement, date_inscription, actif",
+        {"abonnement": payload.abonnement, "user_id": user_id},
+    )
+    row = result.mappings().first()
+    return UserResponse(**dict(row))
 
 
 @router.get("/users/{user_id}/objectives", response_model=list[ObjectifResponse])
@@ -416,3 +475,93 @@ def get_user_objectives(user_id: int):
     """
     rows = fetch_all(sql, {"user_id": user_id})
     return [ObjectifResponse(**row) for row in rows]
+
+
+class AvailableObjectif(BaseModel):
+    id: int
+    libelle: str
+    description: str
+
+
+@router.get("/objectifs", response_model=list[AvailableObjectif])
+def list_available_objectifs():
+    rows = fetch_all("SELECT id, libelle, description FROM objectif ORDER BY id", {})
+    return [AvailableObjectif(**row) for row in rows]
+
+
+class ObjectiveAdd(BaseModel):
+    objectif_id: int
+
+
+@router.post("/users/{user_id}/objectives", response_model=ObjectifResponse)
+def add_user_objective(user_id: int, payload: ObjectiveAdd):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    objectif = fetch_one("SELECT id, libelle, description FROM objectif WHERE id = :id", {"id": payload.objectif_id})
+    if not objectif:
+        raise HTTPException(404, "Objectif introuvable")
+
+    existing = fetch_one(
+        "SELECT 1 FROM utilisateur_objectif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
+        {"user_id": user_id, "objectif_id": payload.objectif_id},
+    )
+    if existing:
+        raise HTTPException(400, "Cet objectif est déjà défini pour cet utilisateur")
+
+    execute_write(
+        "INSERT INTO utilisateur_objectif (utilisateur_id, objectif_id, date_debut, actif)"
+        " VALUES (:user_id, :objectif_id, CURRENT_DATE, true)",
+        {"user_id": user_id, "objectif_id": payload.objectif_id},
+    )
+    row = fetch_one(
+        "SELECT o.id, o.libelle, o.description, uo.date_debut, uo.actif"
+        " FROM utilisateur_objectif uo JOIN objectif o ON uo.objectif_id = o.id"
+        " WHERE uo.utilisateur_id = :user_id AND uo.objectif_id = :objectif_id",
+        {"user_id": user_id, "objectif_id": payload.objectif_id},
+    )
+    return ObjectifResponse(**row)
+
+
+class ObjectiveToggle(BaseModel):
+    actif: bool
+
+
+@router.patch("/users/{user_id}/objectives/{objectif_id}", response_model=ObjectifResponse)
+def toggle_user_objective(user_id: int, objectif_id: int, payload: ObjectiveToggle):
+    existing = fetch_one(
+        "SELECT 1 FROM utilisateur_objectif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
+        {"user_id": user_id, "objectif_id": objectif_id},
+    )
+    if not existing:
+        raise HTTPException(404, "Objectif introuvable pour cet utilisateur")
+
+    execute_write(
+        "UPDATE utilisateur_objectif SET actif = :actif WHERE utilisateur_id = :user_id AND objectif_id = :objectif_id",
+        {"actif": payload.actif, "user_id": user_id, "objectif_id": objectif_id},
+    )
+    row = fetch_one(
+        "SELECT o.id, o.libelle, o.description, uo.date_debut, uo.actif"
+        " FROM utilisateur_objectif uo JOIN objectif o ON uo.objectif_id = o.id"
+        " WHERE uo.utilisateur_id = :user_id AND uo.objectif_id = :objectif_id",
+        {"user_id": user_id, "objectif_id": objectif_id},
+    )
+    return ObjectifResponse(**row)
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: int):
+    user = fetch_one("SELECT id FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    if not user:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    execute_write(
+        "DELETE FROM ligne_repas WHERE journal_id IN (SELECT id FROM journal_repas WHERE utilisateur_id = :user_id)",
+        {"user_id": user_id},
+    )
+    execute_write("DELETE FROM journal_repas WHERE utilisateur_id = :user_id", {"user_id": user_id})
+    execute_write("DELETE FROM utilisateur_objectif WHERE utilisateur_id = :user_id", {"user_id": user_id})
+    execute_write("DELETE FROM metrique_quotidienne WHERE utilisateur_id = :user_id", {"user_id": user_id})
+    execute_write("DELETE FROM utilisateur WHERE id = :user_id", {"user_id": user_id})
+    return {"status": "deleted", "user_id": user_id}
