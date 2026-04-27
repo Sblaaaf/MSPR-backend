@@ -1,3 +1,4 @@
+import os
 from hashlib import sha256
 from pydantic import BaseModel, EmailStr, Field
 from fastapi import APIRouter, Depends, HTTPException
@@ -68,3 +69,24 @@ def login(payload: LoginRequest, language: str = Depends(get_language)):
         prenom=user["prenom"],
         abonnement=user["abonnement"],
     )
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminLoginResponse(BaseModel):
+    success: bool
+    role: str = "admin"
+
+
+@router.post("/admin-login", response_model=AdminLoginResponse)
+def admin_login(payload: AdminLoginRequest):
+    expected_username = os.getenv("ADMIN_USERNAME", "admin")
+    expected_password = os.getenv("ADMIN_PASSWORD", "admin")
+
+    if payload.username != expected_username or payload.password != expected_password:
+        raise HTTPException(status_code=401, detail="Identifiants administrateur invalides.")
+
+    return AdminLoginResponse(success=True, role="admin")

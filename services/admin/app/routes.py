@@ -358,7 +358,7 @@ def data_quality():
             (SELECT COUNT(*) FROM exercice)                                        AS nb_exercices,
             (SELECT COUNT(*) FROM metrique_quotidienne)                            AS nb_metriques,
             (SELECT COUNT(*) FROM metrique_quotidienne WHERE poids_kg IS NULL)     AS metriques_sans_poids,
-            (SELECT COUNT(*) FROM etl_run_log ORDER BY started_at DESC LIMIT 1)   AS nb_runs_etl
+            (SELECT COUNT(*) FROM etl_run_log)                                     AS nb_runs_etl
     """)
 
     dernier_run = fetch_one(

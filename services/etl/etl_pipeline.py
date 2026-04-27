@@ -288,7 +288,7 @@ def sauvegarder_run_en_base(
                     VALUES
                         (:run_id, :started_at, :finished_at, :statut,
                          :total, :succes, :erreur,
-                         :duree, :rapport::jsonb, :declencheur)
+                         :duree, cast(:rapport as jsonb), :declencheur)
                 """),
                 {
                     "run_id":      run_id,
