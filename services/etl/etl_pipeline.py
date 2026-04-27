@@ -2,7 +2,7 @@
 =============================================================
  HealthAI Coach — Pipeline ETL
  Ingestion, nettoyage et chargement des datasets Kaggle
- Version : 1.0.0
+ Version : 2.0.0
 =============================================================
  Sources traitées :
    1. Daily Food & Nutrition Dataset  → table aliment
@@ -16,13 +16,17 @@
 =============================================================
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import logging
 import hashlib
 import json
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -32,7 +36,6 @@ from sqlalchemy.exc import SQLAlchemyError
 # CONFIGURATION
 # =============================================================
 
-# Modifiez ces valeurs ou utilisez des variables d'environnement
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "localhost"),
     "port":     os.getenv("DB_PORT",     "5432"),
@@ -41,20 +44,58 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "postgres"),
 }
 
-# Dossier contenant les fichiers CSV/JSON téléchargés depuis Kaggle
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-
-# Logs
-LOG_DIR = Path("./logs")
+LOG_DIR  = Path("./logs")
 LOG_DIR.mkdir(exist_ok=True)
 DATA_DIR.mkdir(exist_ok=True)
+
+# =============================================================
+# SCHÉMAS DE VALIDATION PAR DATASET
+# Chaque entrée définit les colonnes attendues et leurs règles.
+# =============================================================
+
+VALIDATION_SCHEMAS: dict[str, dict] = {
+    "aliments": {
+        "colonnes_requises": ["nom"],
+        "colonnes_numeriques": ["calories_100g", "proteines_g", "glucides_g", "lipides_g"],
+        "nb_lignes_min": 5,
+        "plages": {
+            "calories_100g": (0, 9000),
+            "proteines_g":   (0, 100),
+            "glucides_g":    (0, 100),
+            "lipides_g":     (0, 100),
+        },
+    },
+    "gym_members": {
+        "colonnes_requises": ["poids_initial_kg"],
+        "colonnes_numeriques": ["poids_initial_kg", "bpm_max", "bpm_repos", "calories_brulees"],
+        "nb_lignes_min": 5,
+        "plages": {
+            "poids_initial_kg": (30, 300),
+            "bpm_max":          (50, 300),
+            "bpm_repos":        (30, 250),
+            "calories_brulees": (0, 5000),
+        },
+    },
+    "exercices": {
+        "colonnes_requises": ["nom"],
+        "colonnes_numeriques": [],
+        "nb_lignes_min": 3,
+        "plages": {},
+    },
+    "diet_recommendations": {
+        "colonnes_requises": [],
+        "colonnes_numeriques": [],
+        "nb_lignes_min": 1,
+        "plages": {},
+    },
+}
 
 # =============================================================
 # LOGGER
 # =============================================================
 
 def setup_logger() -> logging.Logger:
-    """Configure le logger avec sortie fichier + console."""
     log_file = LOG_DIR / f"etl_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logger = logging.getLogger("healthai_etl")
     logger.setLevel(logging.DEBUG)
@@ -64,12 +105,10 @@ def setup_logger() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # Handler fichier
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    # Handler console
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -87,14 +126,12 @@ logger = setup_logger()
 # =============================================================
 
 def get_engine():
-    """Crée et retourne le moteur SQLAlchemy."""
     url = (
         f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
         f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
     )
     try:
         engine = create_engine(url, echo=False, pool_pre_ping=True)
-        # Test de connexion
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         logger.info("Connexion PostgreSQL établie avec succès.")
@@ -104,12 +141,103 @@ def get_engine():
         sys.exit(1)
 
 
+def init_log_table(engine):
+    """Crée la table etl_run_log si elle n'existe pas encore."""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS etl_run_log (
+                id              SERIAL      PRIMARY KEY,
+                run_id          UUID        NOT NULL DEFAULT gen_random_uuid(),
+                started_at      TIMESTAMP   NOT NULL,
+                finished_at     TIMESTAMP,
+                statut          VARCHAR(20) NOT NULL DEFAULT 'en_cours',
+                nb_etl_total    SMALLINT,
+                nb_etl_succes   SMALLINT,
+                nb_etl_erreur   SMALLINT,
+                duree_secondes  NUMERIC(8,2),
+                rapport_json    JSONB,
+                declencheur     VARCHAR(50) NOT NULL DEFAULT 'manuel'
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_etl_run_started
+            ON etl_run_log(started_at DESC)
+        """))
+        conn.commit()
+    logger.info("Table etl_run_log vérifiée/créée.")
+
+
+# =============================================================
+# VALIDATION DES DATASETS
+# =============================================================
+
+def valider_dataset(df: pd.DataFrame, nom_schema: str) -> dict:
+    """
+    Valide un DataFrame contre son schéma de validation.
+    Retourne un dict avec statut, erreurs et avertissements.
+    """
+    schema = VALIDATION_SCHEMAS.get(nom_schema, {})
+    erreurs = []
+    avertissements = []
+
+    # 1. Nombre de lignes minimum
+    nb_min = schema.get("nb_lignes_min", 1)
+    if len(df) < nb_min:
+        erreurs.append(f"Trop peu de lignes : {len(df)} < {nb_min} minimum requis")
+
+    # 2. Colonnes requises
+    for col in schema.get("colonnes_requises", []):
+        if col not in df.columns:
+            erreurs.append(f"Colonne requise manquante : '{col}'")
+
+    # 3. Valeurs nulles dans les colonnes critiques
+    for col in schema.get("colonnes_requises", []):
+        if col in df.columns:
+            nb_nulls = df[col].isnull().sum()
+            if nb_nulls > 0:
+                avertissements.append(f"'{col}' contient {nb_nulls} valeurs nulles")
+
+    # 4. Plages de valeurs numériques
+    for col, (min_val, max_val) in schema.get("plages", {}).items():
+        if col in df.columns:
+            serie = pd.to_numeric(df[col], errors="coerce")
+            hors_plage = serie.notna() & ((serie < min_val) | (serie > max_val))
+            nb_hors = int(hors_plage.sum())
+            if nb_hors > 0:
+                avertissements.append(
+                    f"'{col}' : {nb_hors} valeurs hors plage [{min_val}, {max_val}]"
+                )
+
+    # 5. Doublons
+    nb_doublons = int(df.duplicated().sum())
+    if nb_doublons > 0:
+        avertissements.append(f"{nb_doublons} lignes dupliquées détectées")
+
+    statut = "ko" if erreurs else ("warning" if avertissements else "ok")
+    resultat = {
+        "schema":          nom_schema,
+        "statut":          statut,
+        "nb_lignes":       len(df),
+        "erreurs":         erreurs,
+        "avertissements":  avertissements,
+        "timestamp":       datetime.now().isoformat(),
+    }
+
+    if erreurs:
+        logger.error(f"[Validation {nom_schema}] ÉCHEC — {erreurs}")
+    elif avertissements:
+        logger.warning(f"[Validation {nom_schema}] OK avec avertissements — {avertissements}")
+    else:
+        logger.info(f"[Validation {nom_schema}] OK")
+
+    return resultat
+
+
 # =============================================================
 # UTILITAIRES GÉNÉRIQUES
 # =============================================================
 
 def rapport_qualite(df: pd.DataFrame, nom_dataset: str) -> dict:
-    """Génère un rapport de qualité pour un DataFrame."""
     rapport = {
         "dataset":          nom_dataset,
         "nb_lignes":        len(df),
@@ -128,11 +256,57 @@ def rapport_qualite(df: pd.DataFrame, nom_dataset: str) -> dict:
 
 
 def sauvegarder_rapport(rapports: list):
-    """Sauvegarde tous les rapports de qualité en JSON."""
     path = LOG_DIR / f"rapport_qualite_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rapports, f, ensure_ascii=False, indent=2)
     logger.info(f"Rapport de qualité sauvegardé : {path}")
+
+
+def sauvegarder_run_en_base(
+    engine,
+    run_id: str,
+    started_at: datetime,
+    rapports: list,
+    duree: float,
+    declencheur: str = "manuel",
+):
+    """Persiste le résultat du run ETL dans etl_run_log."""
+    nb_ok  = sum(1 for r in rapports if r.get("statut") == "succès")
+    nb_err = len(rapports) - nb_ok
+
+    # Sérialiser en JSON (les valeurs Python doivent être JSON-compatibles)
+    rapport_json = json.dumps(rapports, ensure_ascii=False, default=str)
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO etl_run_log
+                        (run_id, started_at, finished_at, statut,
+                         nb_etl_total, nb_etl_succes, nb_etl_erreur,
+                         duree_secondes, rapport_json, declencheur)
+                    VALUES
+                        (:run_id, :started_at, :finished_at, :statut,
+                         :total, :succes, :erreur,
+                         :duree, :rapport::jsonb, :declencheur)
+                """),
+                {
+                    "run_id":      run_id,
+                    "started_at":  started_at,
+                    "finished_at": datetime.now(),
+                    "statut":      "erreur" if nb_err > 0 else "succes",
+                    "total":       len(rapports),
+                    "succes":      nb_ok,
+                    "erreur":      nb_err,
+                    "duree":       round(duree, 2),
+                    "rapport":     rapport_json,
+                    "declencheur": declencheur,
+                },
+            )
+            conn.commit()
+        logger.info(f"Run {run_id} sauvegardé en base.")
+    except Exception as e:
+        logger.error(f"Impossible de sauvegarder le run en base : {e}")
 
 
 def charger_fichier(nom_fichier: str, **kwargs) -> pd.DataFrame | None:
@@ -149,7 +323,7 @@ def charger_fichier(nom_fichier: str, **kwargs) -> pd.DataFrame | None:
         elif ext == ".json":
             df = pd.read_json(chemin, **kwargs)
         elif ext in (".xlsx", ".xls"):
-            df = pd.read_excel(chemin, **kwargs)
+            df = pd.read_excel(chemin, engine="openpyxl", **kwargs)
         else:
             logger.error(f"Format non supporté : {ext}")
             return None
@@ -161,7 +335,6 @@ def charger_fichier(nom_fichier: str, **kwargs) -> pd.DataFrame | None:
 
 
 def inserer_en_base(df: pd.DataFrame, table: str, engine, mode: str = "append"):
-    """Insère un DataFrame dans une table PostgreSQL."""
     if df.empty:
         logger.warning(f"DataFrame vide — aucune insertion dans {table}.")
         return 0
@@ -179,14 +352,9 @@ def inserer_en_base(df: pd.DataFrame, table: str, engine, mode: str = "append"):
 # =============================================================
 
 def etl_aliments(engine) -> dict:
-    """
-    Source  : daily-food-and-nutrition-dataset.csv (Kaggle)
-    Cible   : table aliment
-    """
     logger.info("=" * 50)
     logger.info("ETL 1 : Aliments — début")
 
-    # Suppression sécurisée des dépendances pour éviter les erreurs de clé étrangère
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM ligne_repas"))
         conn.execute(text("DELETE FROM journal_repas"))
@@ -196,16 +364,13 @@ def etl_aliments(engine) -> dict:
 
     df = charger_fichier("daily_food_nutrition_dataset.csv", encoding="utf-8", on_bad_lines="skip")
 
-    # -- Fallback : génération de données simulées si fichier absent --
     if df is None:
         logger.warning("Fichier absent — génération de données simulées pour démo.")
         df = _simuler_aliments()
 
     rapport = rapport_qualite(df, "aliments_brut")
 
-    # --- NETTOYAGE ---
-
-    # 1. Renommage des colonnes (adapter selon les noms réels du CSV Kaggle)
+    # Renommage des colonnes
     rename_map = {
         "Food_Item":         "nom",
         "Food":              "nom",
@@ -236,30 +401,27 @@ def etl_aliments(engine) -> dict:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    # 2. Colonnes obligatoires manquantes → valeur par défaut
     for col in ["calories_100g", "proteines_g", "glucides_g", "lipides_g", "fibres_g"]:
         if col not in df.columns:
             df[col] = 0.0
 
-    # 3. Suppression des lignes sans nom d'aliment
+    # Validation
+    rapport["validation"] = valider_dataset(df, "aliments")
+
     df = df.dropna(subset=["nom"])
     df["nom"] = df["nom"].str.strip().str.title()
 
-    # 4. Valeurs numériques : remplacement des nulls et négatifs
     cols_num = ["calories_100g", "proteines_g", "glucides_g", "lipides_g", "fibres_g"]
     for col in cols_num:
         df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].fillna(0.0).clip(lower=0)
 
-    # 5. Doublons sur le nom
     avant = len(df)
     df = df.drop_duplicates(subset=["nom"], keep="first")
     logger.info(f"Doublons supprimés : {avant - len(df)}")
 
-    # 6. Colonne source
     df["source_dataset"] = "kaggle_daily_food_nutrition"
 
-    # 7. Sélection des colonnes finales
     cols_finales = ["nom", "categorie", "calories_100g", "proteines_g",
                     "glucides_g", "lipides_g", "fibres_g", "sodium_mg",
                     "sucres_g", "source_dataset"]
@@ -267,12 +429,12 @@ def etl_aliments(engine) -> dict:
 
     rapport["apres_nettoyage"] = len(df)
     nb = inserer_en_base(df, "aliment", engine)
+    rapport["statut"] = "succès"
     logger.info(f"ETL 1 terminé — {nb} aliments insérés.")
     return rapport
 
 
 def _simuler_aliments() -> pd.DataFrame:
-    """Génère un mini-dataset d'aliments simulés pour les tests."""
     data = [
         {"nom": "Poulet rôti",      "categorie": "Viandes",      "calories_100g": 165, "proteines_g": 31, "glucides_g": 0,  "lipides_g": 3.6, "fibres_g": 0},
         {"nom": "Riz blanc cuit",   "categorie": "Féculents",    "calories_100g": 130, "proteines_g": 2.7,"glucides_g": 28, "lipides_g": 0.3, "fibres_g": 0.4},
@@ -293,14 +455,9 @@ def _simuler_aliments() -> pd.DataFrame:
 # =============================================================
 
 def etl_utilisateurs_metriques(engine) -> dict:
-    """
-    Source  : gym_members_exercise_tracking.csv (Kaggle)
-    Cible   : tables utilisateur + metrique_quotidienne
-    """
     logger.info("=" * 50)
     logger.info("ETL 2 : Utilisateurs & Métriques — début")
 
-    # Supprimer les données existantes pour permettre la réexécution
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM metrique_quotidienne"))
         conn.execute(text("DELETE FROM utilisateur"))
@@ -315,9 +472,6 @@ def etl_utilisateurs_metriques(engine) -> dict:
 
     rapport = rapport_qualite(df, "gym_members_brut")
 
-    # --- NETTOYAGE ---
-
-    # Renommage (s'adapter aux colonnes réelles du CSV Kaggle)
     rename_map = {
         "Age":              "age",
         "Gender":           "sexe",
@@ -335,13 +489,11 @@ def etl_utilisateurs_metriques(engine) -> dict:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    # Hauteur : convertir mètres → cm si nécessaire
     if "taille_m" in df.columns:
         df["taille_cm"] = (df["taille_m"] * 100).round(0).astype("Int64")
     else:
         df["taille_cm"] = None
 
-    # Sexe : normalisation
     if "sexe" in df.columns:
         df["sexe"] = df["sexe"].str.lower().map({
             "male": "homme", "female": "femme",
@@ -349,13 +501,14 @@ def etl_utilisateurs_metriques(engine) -> dict:
             "m": "homme", "f": "femme",
         }).fillna("non_renseigne")
 
-    # Valeurs numériques
     for col in ["poids_initial_kg", "bpm_max", "bpm_repos", "calories_brulees", "imc", "body_fat_pct"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
             df[col] = df[col].clip(lower=0)
 
-    # Filtre outliers biométriques
+    # Validation avant filtrage
+    rapport["validation"] = valider_dataset(df, "gym_members")
+
     if "poids_initial_kg" in df.columns:
         df = df[df["poids_initial_kg"].between(30, 300) | df["poids_initial_kg"].isna()]
     if "bpm_max" in df.columns:
@@ -364,7 +517,6 @@ def etl_utilisateurs_metriques(engine) -> dict:
     df = df.dropna(subset=["poids_initial_kg"])
     df = df.reset_index(drop=True)
 
-    # --- Création des utilisateurs fictifs ---
     utilisateurs = []
     for i, row in df.iterrows():
         email = f"user_{i+1:05d}@healthai.demo"
@@ -383,37 +535,32 @@ def etl_utilisateurs_metriques(engine) -> dict:
 
     df_users = pd.DataFrame(utilisateurs)
 
-    # Supprimer les doublons email (si re-run)
     with engine.connect() as conn:
         try:
             result = conn.execute(text("SELECT email FROM utilisateur"))
             emails_existants = pd.DataFrame(result.mappings().all())
             df_users = df_users[~df_users["email"].isin(emails_existants["email"])]
         except Exception:
-            pass  # Table vide ou inexistante
+            pass
 
     nb_users = inserer_en_base(df_users, "utilisateur", engine)
 
-    # --- Récupération des IDs insérés ---
     with engine.connect() as conn:
         result = conn.execute(text(
             "SELECT id, email FROM utilisateur WHERE email LIKE 'user_%@healthai.demo'"
         ))
         df_ids = pd.DataFrame(result.mappings().all())
 
-    # --- Création des métriques quotidiennes ---
     metriques = []
     for _, row_id in df_ids.iterrows():
         idx = int(row_id["email"].split("_")[1].split("@")[0]) - 1
         if idx >= len(df):
             continue
         row = df.iloc[idx]
-        # On simule 30 jours de métriques par utilisateur
         for j in range(30):
             date_j = datetime.now().date() - timedelta(days=29 - j)
             poids_j = row.get("poids_initial_kg", 70)
             if pd.notna(poids_j):
-                # Légère variation quotidienne simulée
                 variation = (j - 15) * 0.05
                 poids_j = round(float(poids_j) + variation, 2)
             metriques.append({
@@ -432,12 +579,12 @@ def etl_utilisateurs_metriques(engine) -> dict:
 
     rapport["utilisateurs_inseres"] = nb_users
     rapport["metriques_inserees"]   = nb_metriques
+    rapport["statut"] = "succès"
     logger.info(f"ETL 2 terminé — {nb_users} users + {nb_metriques} métriques.")
     return rapport
 
 
 def _simuler_gym_members() -> pd.DataFrame:
-    """Génère des profils utilisateurs simulés."""
     import random
     random.seed(42)
     data = []
@@ -461,14 +608,9 @@ def _simuler_gym_members() -> pd.DataFrame:
 # =============================================================
 
 def etl_exercices(engine) -> dict:
-    """
-    Source  : exercises.json (fork ExerciseDB sur GitHub)
-    Cible   : tables exercice + exercice_muscle
-    """
     logger.info("=" * 50)
     logger.info("ETL 3 : Exercices — début")
 
-    # Supprimer les données existantes pour permettre la réexécution
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM exercice_muscle"))
         conn.execute(text("DELETE FROM exercice"))
@@ -481,14 +623,12 @@ def etl_exercices(engine) -> dict:
         logger.warning("Fichier exercises.json absent — génération de données simulées.")
         df = _simuler_exercices()
 
-    # Convertir les listes en chaînes pour éviter les erreurs de hash dans rapport_qualite
     for col in df.columns:
-        if df[col].dtype == 'object':
+        if df[col].dtype == "object":
             df[col] = df[col].apply(lambda x: str(x) if isinstance(x, list) else x)
 
     rapport = rapport_qualite(df, "exercices_brut")
 
-    # Renommage (s'adapter au format ExerciseDB)
     rename_map = {
         "name":        "nom",
         "bodyPart":    "type",
@@ -501,11 +641,12 @@ def etl_exercices(engine) -> dict:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    # Nettoyage
+    # Validation
+    rapport["validation"] = valider_dataset(df, "exercices")
+
     df = df.dropna(subset=["nom"])
     df["nom"] = df["nom"].str.strip().str.title()
 
-    # Normalisation niveau
     if "niveau" in df.columns:
         df["niveau"] = df["niveau"].str.lower().map({
             "beginner":     "debutant",
@@ -518,7 +659,6 @@ def etl_exercices(engine) -> dict:
     else:
         df["niveau"] = "debutant"
 
-    # Type d'exercice
     if "type" in df.columns:
         df["type"] = df["type"].str.lower().map({
             "cardio":       "cardio",
@@ -544,7 +684,6 @@ def etl_exercices(engine) -> dict:
 
     nb = inserer_en_base(df_exercices, "exercice", engine)
 
-    # --- Association exercice ↔ groupe musculaire ---
     if "muscle_principal" in df.columns:
         with engine.connect() as conn:
             result_ex = conn.execute(text("SELECT id, nom FROM exercice"))
@@ -562,7 +701,6 @@ def etl_exercices(engine) -> dict:
                 continue
             ex_id = int(match_ex.iloc[0]["id"])
 
-            # Muscle principal
             muscle_nom = str(row.get("muscle_principal", "")).lower()
             match_mu = df_mu_ids[df_mu_ids["nom"].str.lower() == muscle_nom]
             if not match_mu.empty:
@@ -572,14 +710,12 @@ def etl_exercices(engine) -> dict:
                     "role":        "principal"
                 })
 
-            # Muscles secondaires (si présents)
             muscles_secondaires = row.get("muscles_secondaires", [])
             if isinstance(muscles_secondaires, str):
-                # Si c'est une chaîne (après conversion), essayer de la parser
                 try:
                     import ast
                     muscles_secondaires = ast.literal_eval(muscles_secondaires)
-                except:
+                except Exception:
                     muscles_secondaires = []
             elif not isinstance(muscles_secondaires, list):
                 muscles_secondaires = []
@@ -599,22 +735,23 @@ def etl_exercices(engine) -> dict:
             inserer_en_base(df_assoc, "exercice_muscle", engine)
 
     rapport["exercices_inseres"] = nb
+    rapport["statut"] = "succès"
     logger.info(f"ETL 3 terminé — {nb} exercices insérés.")
     return rapport
 
 
 def _simuler_exercices() -> pd.DataFrame:
     data = [
-        {"nom": "Bench Press",        "type": "musculation", "niveau": "intermediaire", "equipement": "barbell",    "muscle_principal": "pectoraux",       "instructions": "Allongé sur le banc, poussez la barre vers le haut."},
-        {"nom": "Squat",              "type": "musculation", "niveau": "debutant",      "equipement": "barbell",    "muscle_principal": "quadriceps",       "instructions": "Descendez jusqu'à ce que les cuisses soient parallèles au sol."},
-        {"nom": "Deadlift",           "type": "musculation", "niveau": "avance",        "equipement": "barbell",    "muscle_principal": "dorsaux",          "instructions": "Soulevez la barre depuis le sol en gardant le dos droit."},
-        {"nom": "Pull Up",            "type": "musculation", "niveau": "intermediaire", "equipement": "barres",     "muscle_principal": "dorsaux",          "instructions": "Accrochez-vous à la barre et tirez-vous vers le haut."},
-        {"nom": "Planche",            "type": "musculation", "niveau": "debutant",      "equipement": "aucun",      "muscle_principal": "abdominaux",       "instructions": "Maintenez la position gainage sur les coudes 30-60 secondes."},
-        {"nom": "Running",            "type": "cardio",      "niveau": "debutant",      "equipement": "aucun",      "muscle_principal": "quadriceps",       "instructions": "Courez à un rythme confortable, dos droit."},
-        {"nom": "Burpees",            "type": "hiit",        "niveau": "intermediaire", "equipement": "aucun",      "muscle_principal": "fessiers",         "instructions": "Enchaînez squat, planche, pompe, saut."},
-        {"nom": "Bicep Curl",         "type": "musculation", "niveau": "debutant",      "equipement": "haltères",   "muscle_principal": "biceps",           "instructions": "Fléchissez les coudes pour ramener les haltères aux épaules."},
-        {"nom": "Tricep Dips",        "type": "musculation", "niveau": "debutant",      "equipement": "banc",       "muscle_principal": "triceps",          "instructions": "Descendez en fléchissant les coudes derrière vous."},
-        {"nom": "Calf Raise",         "type": "musculation", "niveau": "debutant",      "equipement": "aucun",      "muscle_principal": "mollets",          "instructions": "Montez sur la pointe des pieds, tenez 1 seconde, redescendez."},
+        {"nom": "Bench Press",  "type": "musculation", "niveau": "intermediaire", "equipement": "barbell",  "muscle_principal": "pectoraux",  "instructions": "Allongé sur le banc, poussez la barre vers le haut."},
+        {"nom": "Squat",        "type": "musculation", "niveau": "debutant",      "equipement": "barbell",  "muscle_principal": "quadriceps", "instructions": "Descendez jusqu'à ce que les cuisses soient parallèles au sol."},
+        {"nom": "Deadlift",     "type": "musculation", "niveau": "avance",        "equipement": "barbell",  "muscle_principal": "dorsaux",    "instructions": "Soulevez la barre depuis le sol en gardant le dos droit."},
+        {"nom": "Pull Up",      "type": "musculation", "niveau": "intermediaire", "equipement": "barres",   "muscle_principal": "dorsaux",    "instructions": "Accrochez-vous à la barre et tirez-vous vers le haut."},
+        {"nom": "Planche",      "type": "musculation", "niveau": "debutant",      "equipement": "aucun",    "muscle_principal": "abdominaux", "instructions": "Maintenez la position gainage 30-60 secondes."},
+        {"nom": "Running",      "type": "cardio",      "niveau": "debutant",      "equipement": "aucun",    "muscle_principal": "quadriceps", "instructions": "Courez à un rythme confortable, dos droit."},
+        {"nom": "Burpees",      "type": "hiit",        "niveau": "intermediaire", "equipement": "aucun",    "muscle_principal": "fessiers",   "instructions": "Enchaînez squat, planche, pompe, saut."},
+        {"nom": "Bicep Curl",   "type": "musculation", "niveau": "debutant",      "equipement": "haltères", "muscle_principal": "biceps",     "instructions": "Fléchissez les coudes pour ramener les haltères aux épaules."},
+        {"nom": "Tricep Dips",  "type": "musculation", "niveau": "debutant",      "equipement": "banc",     "muscle_principal": "triceps",    "instructions": "Descendez en fléchissant les coudes derrière vous."},
+        {"nom": "Calf Raise",   "type": "musculation", "niveau": "debutant",      "equipement": "aucun",    "muscle_principal": "mollets",    "instructions": "Montez sur la pointe des pieds, tenez 1 seconde, redescendez."},
     ]
     return pd.DataFrame(data)
 
@@ -624,10 +761,6 @@ def _simuler_exercices() -> pd.DataFrame:
 # =============================================================
 
 def etl_objectifs_utilisateurs(engine) -> dict:
-    """
-    Source  : diet_recommendations.csv (Kaggle)
-    Cible   : table utilisateur_objectif
-    """
     logger.info("=" * 50)
     logger.info("ETL 4 : Association utilisateurs ↔ objectifs — début")
 
@@ -638,8 +771,8 @@ def etl_objectifs_utilisateurs(engine) -> dict:
         df = _simuler_objectifs()
 
     rapport = rapport_qualite(df, "diet_recommendations_brut")
+    rapport["validation"] = valider_dataset(df, "diet_recommendations")
 
-    # Mapping objectif
     objectif_map = {
         "weight loss":          "perte_de_poids",
         "muscle gain":          "prise_de_masse",
@@ -667,6 +800,7 @@ def etl_objectifs_utilisateurs(engine) -> dict:
 
     if df_users.empty:
         logger.warning("Aucun utilisateur trouvé. ETL 4 ignoré.")
+        rapport["statut"] = "succès"
         return rapport
 
     assoc_rows = []
@@ -683,9 +817,9 @@ def etl_objectifs_utilisateurs(engine) -> dict:
                 "actif":          True,
             })
 
+    nb = 0
     if assoc_rows:
         df_assoc = pd.DataFrame(assoc_rows).drop_duplicates(subset=["utilisateur_id", "objectif_id"])
-        # Supprimer les associations existantes pour éviter les conflits
         with engine.connect() as conn:
             for _, row in df_assoc.iterrows():
                 conn.execute(text(
@@ -693,10 +827,9 @@ def etl_objectifs_utilisateurs(engine) -> dict:
                 ), {"uid": int(row["utilisateur_id"]), "oid": int(row["objectif_id"])})
             conn.commit()
         nb = inserer_en_base(df_assoc, "utilisateur_objectif", engine)
-    else:
-        nb = 0
 
     rapport["associations_inserees"] = nb
+    rapport["statut"] = "succès"
     logger.info(f"ETL 4 terminé — {nb} associations objectifs insérées.")
     return rapport
 
@@ -713,44 +846,78 @@ def _simuler_objectifs() -> pd.DataFrame:
 # ORCHESTRATEUR PRINCIPAL
 # =============================================================
 
-def run_pipeline():
-    """Lance l'ensemble du pipeline ETL et sauvegarde les rapports."""
+# Variable globale pour suivre l'état du run en cours
+_run_en_cours: dict | None = None
+
+
+def run_pipeline(declencheur: str = "manuel") -> dict:
+    """
+    Lance l'ensemble du pipeline ETL.
+    Retourne un résumé du run (statut, durée, nb ETL ok/erreur).
+    """
+    global _run_en_cours
+
+    run_id = str(uuid.uuid4())
     start = datetime.now()
+
+    _run_en_cours = {
+        "run_id":      run_id,
+        "started_at":  start.isoformat(),
+        "statut":      "en_cours",
+        "declencheur": declencheur,
+    }
+
     logger.info("╔══════════════════════════════════════════╗")
     logger.info("║   HealthAI Coach — Pipeline ETL démarré  ║")
-    logger.info(f"║   {start.strftime('%Y-%m-%d %H:%M:%S')}                      ║")
+    logger.info(f"║   {start.strftime('%Y-%m-%d %H:%M:%S')} | {declencheur:<16}  ║")
     logger.info("╚══════════════════════════════════════════╝")
 
     engine = get_engine()
+    init_log_table(engine)
     rapports = []
 
-    # -- Exécution de chaque ETL --
     etl_fonctions = [
-        ("ETL 1 - Aliments",          etl_aliments),
-        ("ETL 2 - Utilisateurs",       etl_utilisateurs_metriques),
-        ("ETL 3 - Exercices",          etl_exercices),
-        ("ETL 4 - Objectifs users",    etl_objectifs_utilisateurs),
+        ("ETL 1 - Aliments",       etl_aliments),
+        ("ETL 2 - Utilisateurs",   etl_utilisateurs_metriques),
+        ("ETL 3 - Exercices",      etl_exercices),
+        ("ETL 4 - Objectifs users",etl_objectifs_utilisateurs),
     ]
 
     for nom, fn in etl_fonctions:
         try:
             rapport = fn(engine)
-            rapport["statut"] = "succès"
+            rapport["statut"] = rapport.get("statut", "succès")
             rapports.append(rapport)
         except Exception as e:
             logger.error(f"ERREUR dans {nom} : {e}", exc_info=True)
             rapports.append({"dataset": nom, "statut": "erreur", "message": str(e)})
 
-    # -- Rapport final --
     duree = (datetime.now() - start).total_seconds()
     sauvegarder_rapport(rapports)
+    sauvegarder_run_en_base(engine, run_id, start, rapports, duree, declencheur)
+
+    nb_ok  = sum(1 for r in rapports if r.get("statut") == "succès")
+    nb_err = len(rapports) - nb_ok
+
+    _run_en_cours = None
 
     logger.info("╔══════════════════════════════════════════╗")
     logger.info(f"║   Pipeline terminé en {duree:.1f}s               ║")
-    nb_ok  = sum(1 for r in rapports if r.get("statut") == "succès")
-    nb_err = len(rapports) - nb_ok
     logger.info(f"║   {nb_ok} ETL réussis | {nb_err} erreurs               ║")
     logger.info("╚══════════════════════════════════════════╝")
+
+    return {
+        "run_id":          run_id,
+        "statut":          "erreur" if nb_err > 0 else "succes",
+        "nb_etl_succes":   nb_ok,
+        "nb_etl_erreur":   nb_err,
+        "duree_secondes":  round(duree, 2),
+        "declencheur":     declencheur,
+    }
+
+
+def get_run_en_cours() -> dict | None:
+    return _run_en_cours
 
 
 if __name__ == "__main__":

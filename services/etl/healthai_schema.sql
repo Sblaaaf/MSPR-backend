@@ -340,6 +340,25 @@ COMMENT ON TABLE seance                IS 'Séances d''entraînement réalisées
 COMMENT ON TABLE seance_exercice       IS 'Exercices effectués lors d''une séance';
 COMMENT ON TABLE metrique_quotidienne  IS 'Métriques biométriques quotidiennes (source : Kaggle Gym Members & Fitness Tracker)';
 
+-- -------------------------------------------------------------
+-- 16. Table ETL_RUN_LOG  (historique des exécutions ETL)
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS etl_run_log (
+    id              SERIAL      PRIMARY KEY,
+    run_id          UUID        NOT NULL DEFAULT gen_random_uuid(),
+    started_at      TIMESTAMP   NOT NULL,
+    finished_at     TIMESTAMP,
+    statut          VARCHAR(20) NOT NULL DEFAULT 'en_cours',  -- en_cours | succes | erreur
+    nb_etl_total    SMALLINT,
+    nb_etl_succes   SMALLINT,
+    nb_etl_erreur   SMALLINT,
+    duree_secondes  NUMERIC(8,2),
+    rapport_json    JSONB,
+    declencheur     VARCHAR(50) NOT NULL DEFAULT 'manuel'     -- manuel | scheduler
+);
+
+CREATE INDEX IF NOT EXISTS idx_etl_run_started ON etl_run_log(started_at DESC);
+
 -- =============================================================
 -- FIN DU SCRIPT
 -- Déploiement : psql -U postgres -d healthai -f healthai_schema.sql

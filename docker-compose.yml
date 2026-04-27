@@ -38,6 +38,9 @@ services:
       - DB_USER=postgres
       - DB_PASSWORD=postgres
       - DATA_DIR=/app/data
+      - ETL_CRON_HOUR=3
+      - ETL_CRON_MINUTE=0
+      - ETL_SCHEDULER_ENABLED=true
     depends_on:
       db:
         condition: service_healthy
@@ -53,10 +56,14 @@ services:
       - KCAL_SERVICE_URL=http://kcal:8001
       - MEAL_SERVICE_URL=http://meal:8003
       - AUTH_SERVICE_URL=http://auth:8004
+      - ETL_SERVICE_URL=http://etl:8002
+      - ADMIN_SERVICE_URL=http://admin:8005
     depends_on:
       - kcal
       - meal
       - auth
+      - etl
+      - admin
 
   kcal:
     build: ./services/kcal
@@ -98,6 +105,22 @@ services:
       - DB_PASSWORD=postgres
     depends_on:
       - db
+
+  admin:
+    build: ./services/admin
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./services/admin:/app
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=healthai
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
   postgres_data:
