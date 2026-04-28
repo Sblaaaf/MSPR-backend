@@ -850,6 +850,142 @@ def _simuler_objectifs() -> pd.DataFrame:
 _run_en_cours: dict | None = None
 
 
+# =============================================================
+# ETL 5 — FICHIERS ADDITIONNELS (auto-détection Kaggle / uploads)
+# =============================================================
+
+# Fichiers déjà gérés par les ETL 1-4 — on ne les retraite pas
+_FICHIERS_CATALOGUES = {
+    "daily_food_nutrition_dataset.csv",
+    "gym_members_exercise.csv",
+    "exercises.json",
+    "diet_recommendations.csv",
+    "fitness_tracker.csv",
+}
+
+# Mots-clés pour détecter le type de données à partir des noms de colonnes
+_SIGNES_ALIMENTS   = {"calorie", "protein", "fat", "carb", "fiber", "sugar",
+                       "sodium", "nutrient", "food", "kcal", "vitamin",
+                       "energy", "aliment", "nutrition"}
+_SIGNES_EXERCICES  = {"exercise", "workout", "muscle", "equipment", "level",
+                       "fitness", "gym", "sport", "movement", "difficulty"}
+_SIGNES_UTILISATEURS = {"weight", "height", "bmi", "heart_rate", "age",
+                         "gender", "sex", "member", "user", "poids", "taille"}
+
+
+def _detecter_type_fichier(df: pd.DataFrame) -> str | None:
+    """Retourne 'aliments', 'exercices', 'utilisateurs', ou None si non détecté."""
+    cols = {c.lower().replace(" ", "_").replace("-", "_") for c in df.columns}
+    score = {
+        "aliments":     sum(1 for k in _SIGNES_ALIMENTS    if any(k in c for c in cols)),
+        "exercices":    sum(1 for k in _SIGNES_EXERCICES   if any(k in c for c in cols)),
+        "utilisateurs": sum(1 for k in _SIGNES_UTILISATEURS if any(k in c for c in cols)),
+    }
+    best, val = max(score.items(), key=lambda x: x[1])
+    return best if val >= 2 else None
+
+
+_RENAME_ALIMENTS = {
+    "food_item": "nom", "food": "nom", "item": "nom", "name": "nom", "food_name": "nom",
+    "calories": "calories_100g", "energy_kcal": "calories_100g", "energy": "calories_100g",
+    "kcal": "calories_100g", "calories_kcal": "calories_100g",
+    "protein": "proteines_g", "proteins": "proteines_g", "protein_g": "proteines_g",
+    "carbohydrates": "glucides_g", "carbs": "glucides_g", "carb": "glucides_g",
+    "carbohydrates_g": "glucides_g",
+    "fat": "lipides_g", "fats": "lipides_g", "fat_g": "lipides_g", "total_fat": "lipides_g",
+    "fiber": "fibres_g", "fibre": "fibres_g", "dietary_fiber": "fibres_g",
+    "sugar": "sucres_g", "sugars": "sucres_g",
+    "sodium": "sodium_mg",
+    "category": "categorie", "food_category": "categorie", "type": "categorie",
+}
+
+_RENAME_EXERCICES = {
+    "exercise_name": "nom", "exercise": "nom", "name": "nom", "workout": "nom",
+    "type": "type", "exercise_type": "type", "category": "type",
+    "level": "niveau", "difficulty": "niveau", "difficulty_level": "niveau",
+    "equipment": "equipement", "equipment_needed": "equipement",
+    "description": "description", "instructions": "instructions",
+}
+
+
+def etl_fichiers_additionnels(engine) -> dict:
+    """Auto-détecte et importe les fichiers uploadés ou téléchargés depuis Kaggle."""
+    rapport = {"dataset": "fichiers_additionnels", "fichiers": []}
+
+    candidats = [
+        f for f in DATA_DIR.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in {".csv", ".json", ".xlsx"}
+        and f.name not in _FICHIERS_CATALOGUES
+    ]
+
+    if not candidats:
+        logger.info("[auto-detect] Aucun nouveau fichier à traiter.")
+        rapport["statut"] = "succès"
+        rapport["message"] = "Aucun nouveau fichier"
+        return rapport
+
+    logger.info(f"[auto-detect] {len(candidats)} fichier(s) candidat(s) détectés.")
+
+    for filepath in candidats:
+        try:
+            df = charger_fichier(filepath.name)
+            if df is None or df.empty:
+                continue
+
+            ftype = _detecter_type_fichier(df)
+            if ftype is None:
+                logger.warning(f"[auto-detect] {filepath.name} — type non identifié, ignoré.")
+                continue
+
+            logger.info(f"[auto-detect] {filepath.name} → {ftype}")
+
+            # Normalise les noms de colonnes
+            df.columns = [c.lower().strip().replace(" ", "_").replace("-", "_")
+                          for c in df.columns]
+
+            if ftype == "aliments":
+                df = df.rename(columns={k: v for k, v in _RENAME_ALIMENTS.items() if k in df.columns})
+                if "nom" not in df.columns:
+                    logger.warning(f"[auto-detect] {filepath.name} — colonne 'nom' introuvable après renommage, ignoré.")
+                    continue
+                for col in ["calories_100g", "proteines_g", "glucides_g", "lipides_g", "fibres_g"]:
+                    if col not in df.columns:
+                        df[col] = 0.0
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(lower=0)
+                df = df.dropna(subset=["nom"]).drop_duplicates(subset=["nom"], keep="first")
+                df["source_dataset"] = filepath.stem
+                cols = ["nom", "categorie", "calories_100g", "proteines_g",
+                        "glucides_g", "lipides_g", "fibres_g", "sodium_mg", "sucres_g", "source_dataset"]
+                df = df[[c for c in cols if c in df.columns]]
+                nb = inserer_en_base(df, "aliment", engine)
+                rapport["fichiers"].append({"fichier": filepath.name, "type": "aliments", "inseres": nb})
+
+            elif ftype == "exercices":
+                df = df.rename(columns={k: v for k, v in _RENAME_EXERCICES.items() if k in df.columns})
+                if "nom" not in df.columns:
+                    logger.warning(f"[auto-detect] {filepath.name} — colonne 'nom' introuvable, ignoré.")
+                    continue
+                df = df.dropna(subset=["nom"]).drop_duplicates(subset=["nom"], keep="first")
+                df["source_dataset"] = filepath.stem
+                cols = ["nom", "type", "niveau", "equipement", "description", "instructions", "source_dataset"]
+                df = df[[c for c in cols if c in df.columns]]
+                nb = inserer_en_base(df, "exercice", engine)
+                rapport["fichiers"].append({"fichier": filepath.name, "type": "exercices", "inseres": nb})
+
+            elif ftype == "utilisateurs":
+                logger.info(f"[auto-detect] {filepath.name} détecté comme données utilisateurs — importation métriques uniquement.")
+                rapport["fichiers"].append({"fichier": filepath.name, "type": "utilisateurs", "inseres": 0,
+                                            "note": "Import utilisateurs nécessite mapping manuel"})
+
+        except Exception as e:
+            logger.error(f"[auto-detect] Erreur sur {filepath.name} : {e}", exc_info=True)
+            rapport["fichiers"].append({"fichier": filepath.name, "erreur": str(e)})
+
+    rapport["statut"] = "succès"
+    return rapport
+
+
 def run_pipeline(declencheur: str = "manuel") -> dict:
     """
     Lance l'ensemble du pipeline ETL.
@@ -877,10 +1013,11 @@ def run_pipeline(declencheur: str = "manuel") -> dict:
     rapports = []
 
     etl_fonctions = [
-        ("ETL 1 - Aliments",       etl_aliments),
-        ("ETL 2 - Utilisateurs",   etl_utilisateurs_metriques),
-        ("ETL 3 - Exercices",      etl_exercices),
-        ("ETL 4 - Objectifs users",etl_objectifs_utilisateurs),
+        ("ETL 1 - Aliments",           etl_aliments),
+        ("ETL 2 - Utilisateurs",       etl_utilisateurs_metriques),
+        ("ETL 3 - Exercices",          etl_exercices),
+        ("ETL 4 - Objectifs users",    etl_objectifs_utilisateurs),
+        ("ETL 5 - Fichiers additionnels", etl_fichiers_additionnels),
     ]
 
     for nom, fn in etl_fonctions:

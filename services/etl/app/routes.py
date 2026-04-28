@@ -1,12 +1,35 @@
+import csv
+import io
 import os
 import json
+import subprocess
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from etl_pipeline import run_pipeline, get_run_en_cours
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+ALLOWED_EXTENSIONS = {".csv", ".json", ".xlsx"}
+MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB
+
+# Simple in-memory rate limiter for upload / Kaggle endpoints
+_upload_calls: dict[str, list[float]] = {}
+
+
+def _check_rate(ip: str, limit: int = 10, window: int = 60) -> None:
+    import time
+    now = time.time()
+    calls = [t for t in _upload_calls.get(ip, []) if now - t < window]
+    if len(calls) >= limit:
+        raise HTTPException(status_code=429, detail=f"Trop de requêtes — limite {limit}/{window}s")
+    calls.append(now)
+    _upload_calls[ip] = calls
 
 router = APIRouter()
 
@@ -168,3 +191,149 @@ async def data_quality_metrics():
 
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=f"Erreur base de données : {e}")
+
+
+# ------------------------------------------------------------------
+# Gestion des fichiers datasets (upload / liste / suppression)
+# ------------------------------------------------------------------
+
+@router.get("/datasets", tags=["datasets"], summary="Lister les fichiers disponibles")
+async def list_datasets():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    files = []
+    for f in sorted(DATA_DIR.iterdir()):
+        if f.is_file() and f.suffix.lower() in ALLOWED_EXTENSIONS:
+            stat = f.stat()
+            files.append({
+                "filename": f.name,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+    return {"datasets": files, "total": len(files)}
+
+
+@router.post("/datasets/upload", tags=["datasets"], summary="Uploader un fichier dataset (CSV/JSON/XLSX)")
+async def upload_dataset(
+    request: Request,
+    file: UploadFile = File(...),
+    trigger_etl: bool = Form(default=True),
+    background_tasks: BackgroundTasks = None,
+):
+    _check_rate(request.client.host, limit=10, window=60)
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Extension non supportée : {ext}. Acceptés : csv, json, xlsx")
+
+    # Sécurité : pas de path traversal
+    safe_name = Path(file.filename).name
+    content = await file.read()
+
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(413, f"Fichier trop volumineux (max 100 Mo, reçu {len(content) // 1024 // 1024} Mo)")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    dest = DATA_DIR / safe_name
+    dest.write_bytes(content)
+
+    if trigger_etl and background_tasks is not None:
+        background_tasks.add_task(run_pipeline, "upload")
+
+    return {
+        "uploaded": safe_name,
+        "size_bytes": len(content),
+        "etl_triggered": trigger_etl,
+    }
+
+
+@router.delete("/datasets/{filename}", tags=["datasets"], summary="Supprimer un fichier dataset")
+async def delete_dataset(filename: str):
+    if "/" in filename or ".." in filename:
+        raise HTTPException(400, "Nom de fichier invalide")
+    path = DATA_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, "Fichier introuvable")
+    path.unlink()
+    return {"deleted": filename}
+
+
+# ------------------------------------------------------------------
+# Intégration Kaggle
+# ------------------------------------------------------------------
+
+def _kaggle_env() -> dict:
+    """Retourne les variables d'env pour le CLI kaggle."""
+    env = os.environ.copy()
+    # Le CLI kaggle lit KAGGLE_USERNAME et KAGGLE_KEY en variable d'env
+    return env
+
+
+@router.get("/kaggle/search", tags=["kaggle"], summary="Rechercher des datasets Kaggle")
+async def kaggle_search(request: Request, q: str = "", page: int = 1):
+    _check_rate(request.client.host, limit=20, window=60)
+
+    username = os.getenv("KAGGLE_USERNAME")
+    kaggle_key = os.getenv("KAGGLE_KEY")
+    if not username or not kaggle_key:
+        raise HTTPException(503, "Kaggle non configuré — définir KAGGLE_USERNAME et KAGGLE_KEY")
+
+    try:
+        result = subprocess.run(
+            ["kaggle", "datasets", "list", "--search", q or "health",
+             "--page", str(page), "--csv", "--max-size", "500"],
+            capture_output=True, text=True, env=_kaggle_env(), timeout=30,
+        )
+    except FileNotFoundError:
+        raise HTTPException(503, "CLI kaggle introuvable — vérifier l'installation")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Timeout Kaggle (>30s)")
+
+    if result.returncode != 0:
+        raise HTTPException(500, f"Kaggle error: {result.stderr[:300]}")
+
+    reader = csv.DictReader(io.StringIO(result.stdout))
+    datasets = [row for row in reader]
+    return {"datasets": datasets, "page": page, "query": q}
+
+
+@router.post("/kaggle/download", tags=["kaggle"], summary="Télécharger un dataset Kaggle et lancer l'ETL")
+async def kaggle_download(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    dataset: str = Form(...),
+    trigger_etl: bool = Form(default=True),
+):
+    _check_rate(request.client.host, limit=3, window=60)
+
+    username = os.getenv("KAGGLE_USERNAME")
+    kaggle_key = os.getenv("KAGGLE_KEY")
+    if not username or not kaggle_key:
+        raise HTTPException(503, "Kaggle non configuré — définir KAGGLE_USERNAME et KAGGLE_KEY")
+
+    # Validation format owner/dataset-slug
+    if "/" not in dataset or len(dataset.split("/")) != 2:
+        raise HTTPException(400, "Format attendu : owner/dataset-slug")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = subprocess.run(
+            ["kaggle", "datasets", "download", dataset,
+             "--unzip", "--path", str(DATA_DIR)],
+            capture_output=True, text=True, env=_kaggle_env(), timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Timeout téléchargement Kaggle (>120s)")
+
+    if result.returncode != 0:
+        raise HTTPException(500, f"Kaggle download error: {result.stderr[:300]}")
+
+    if trigger_etl:
+        background_tasks.add_task(run_pipeline, "kaggle")
+
+    return {
+        "downloaded": dataset,
+        "output_dir": str(DATA_DIR),
+        "etl_triggered": trigger_etl,
+        "stdout": result.stdout[:500],
+    }

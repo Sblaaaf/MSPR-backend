@@ -41,6 +41,8 @@ services:
       - ETL_CRON_HOUR=3
       - ETL_CRON_MINUTE=0
       - ETL_SCHEDULER_ENABLED=true
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME:-}
+      - KAGGLE_KEY=${KAGGLE_KEY:-}
     depends_on:
       db:
         condition: service_healthy
@@ -122,5 +124,40 @@ services:
       db:
         condition: service_healthy
 
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=recommendation_db
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  recommendation:
+    build: ./services/recommendation
+    ports:
+      - "8006:8006"
+    volumes:
+      - ./services/recommendation:/app
+      - ./services/etl/data:/app/data
+      - recommendation_models:/app/models
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017
+      - MONGODB_DB=recommendation_db
+      - RECOMMENDATION_API_KEY=${RECOMMENDATION_API_KEY}
+      - DATA_DIR=/app/data
+      - MODELS_DIR=/app/models
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
 volumes:
   postgres_data:
+  mongodb_data:
+  recommendation_models:

@@ -113,14 +113,22 @@ def health():
 # ================================================================
 
 @router.get("/users", tags=["utilisateurs"], summary="Lister les utilisateurs")
-def list_users(limit: int = 50, offset: int = 0, actif: Optional[bool] = None):
-    where = "WHERE actif = :actif" if actif is not None else ""
+def list_users(limit: int = 50, offset: int = 0, actif: Optional[bool] = None, search: Optional[str] = None):
+    conditions = []
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if actif is not None:
+        conditions.append("actif = :actif")
+        params["actif"] = actif
+    if search:
+        conditions.append("(nom ILIKE :search OR prenom ILIKE :search OR email ILIKE :search)")
+        params["search"] = f"%{search}%"
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     rows = fetch_all(
         f"SELECT id, nom, prenom, email, sexe, poids_initial_kg, taille_cm, abonnement, actif, imc, created_at "
         f"FROM utilisateur {where} ORDER BY id LIMIT :limit OFFSET :offset",
-        {"limit": limit, "offset": offset, "actif": actif},
+        params,
     )
-    total = fetch_one(f"SELECT COUNT(*) AS n FROM utilisateur {where}", {"actif": actif})
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM utilisateur {where}", params)
     return {"total": total["n"], "data": rows}
 
 
@@ -173,14 +181,22 @@ def delete_user(user_id: int):
 # ================================================================
 
 @router.get("/foods", tags=["aliments"], summary="Lister les aliments")
-def list_foods(limit: int = 50, offset: int = 0, categorie: Optional[str] = None):
-    where = "WHERE categorie = :cat" if categorie else ""
+def list_foods(limit: int = 50, offset: int = 0, categorie: Optional[str] = None, search: Optional[str] = None):
+    conditions = []
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if categorie:
+        conditions.append("categorie = :cat")
+        params["cat"] = categorie
+    if search:
+        conditions.append("(nom ILIKE :search OR categorie ILIKE :search)")
+        params["search"] = f"%{search}%"
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     rows = fetch_all(
         f"SELECT id, nom, categorie, calories_100g, proteines_g, glucides_g, lipides_g, fibres_g, source_dataset "
         f"FROM aliment {where} ORDER BY nom LIMIT :limit OFFSET :offset",
-        {"limit": limit, "offset": offset, "cat": categorie},
+        params,
     )
-    total = fetch_one(f"SELECT COUNT(*) AS n FROM aliment {where}", {"cat": categorie})
+    total = fetch_one(f"SELECT COUNT(*) AS n FROM aliment {where}", params)
     return {"total": total["n"], "data": rows}
 
 
@@ -231,7 +247,7 @@ def delete_food(food_id: int):
 # ================================================================
 
 @router.get("/exercises", tags=["exercices"])
-def list_exercises(limit: int = 50, offset: int = 0, niveau: Optional[str] = None, type: Optional[str] = None):
+def list_exercises(limit: int = 50, offset: int = 0, niveau: Optional[str] = None, type: Optional[str] = None, search: Optional[str] = None):
     conditions = []
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if niveau:
@@ -240,6 +256,9 @@ def list_exercises(limit: int = 50, offset: int = 0, niveau: Optional[str] = Non
     if type:
         conditions.append("type = :type")
         params["type"] = type
+    if search:
+        conditions.append("(nom ILIKE :search OR type ILIKE :search OR equipement ILIKE :search)")
+        params["search"] = f"%{search}%"
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     rows = fetch_all(
         f"SELECT id, nom, type, niveau, equipement, source_dataset FROM exercice {where} ORDER BY nom LIMIT :limit OFFSET :offset",
